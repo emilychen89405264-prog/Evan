@@ -10,7 +10,7 @@ PORTFOLIO_FILE = 'data/paper_portfolio.csv'
 INITIAL_CAPITAL = 50000.0   
 POSITION_SIZE_RATIO = 0.1   
 
-# ✅ 關鍵設定：解決中文對齊問題
+# ✅ 設定 Pandas 顯示格式
 pd.set_option('display.unicode.east_asian_width', True)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 1000)
@@ -34,13 +34,13 @@ def generate_report():
         print("[ERROR] 找不到交易紀錄檔。")
         return
 
-    # 1. 讀取數據 (處理新增的欄位缺失值，防止舊資料報錯)
+    # 1. 讀取數據
     df = pd.read_csv(PORTFOLIO_FILE)
     if df.empty:
         print("[INFO] 尚無交易紀錄。")
         return
         
-    # 如果舊資料沒有 Strategy/Leverage 欄位，補上預設值
+    # 補上預設值 (防止舊版 CSV 報錯)
     if 'Strategy' not in df.columns: df['Strategy'] = 'N/A'
     if 'Leverage' not in df.columns: df['Leverage'] = 1
 
@@ -57,7 +57,6 @@ def generate_report():
     for index, row in closed_df.iterrows():
         bet_size = balance * POSITION_SIZE_RATIO
         
-        # ✅ 計算真實損益 (原始漲跌幅 * 槓桿)
         leverage = float(row.get('Leverage', 1))
         real_pnl_percent = row['PnL_Percent'] * leverage
         
@@ -68,12 +67,12 @@ def generate_report():
             '時間': row['Exit_Time'].strftime('%Y-%m-%d %H:%M'),
             '幣種': row['Symbol'],
             '方向': row['Action'],
-            '策略': row['Strategy'],  # ✅ 顯示策略
-            '槓桿': f"{leverage:.0f}x",   # ✅ 顯示槓桿
+            '策略': row['Strategy'],
+            '槓桿': f"{leverage:.0f}x",
             '狀態': '已平倉',
             '進場價': row['Entry_Price'],
             '現價/出場': row['Exit_Price'],
-            '報酬率%': real_pnl_percent, # 顯示槓桿後報酬
+            '報酬率%': real_pnl_percent,
             '損益(USD)': profit_loss_usd,
             '結算餘額': balance
         })
@@ -95,15 +94,12 @@ def generate_report():
             
             curr_price = current_prices.get(symbol, entry_price)
             
-            # 計算原始漲跌
             if action == 'BUY':
                 raw_pct = (curr_price - entry_price) / entry_price * 100
             else:
                 raw_pct = (entry_price - curr_price) / entry_price * 100
             
-            # ✅ 乘上槓桿
             real_pnl_percent = raw_pct * leverage
-            
             bet_size = realized_balance * POSITION_SIZE_RATIO
             float_pnl_usd = bet_size * (real_pnl_percent / 100)
             
@@ -113,12 +109,12 @@ def generate_report():
                 '時間': '持倉中',
                 '幣種': symbol,
                 '方向': action,
-                '策略': row['Strategy'],  # ✅ 顯示策略
-                '槓桿': f"{leverage:.0f}x",   # ✅ 顯示槓桿
+                '策略': row['Strategy'],
+                '槓桿': f"{leverage:.0f}x",
                 '狀態': '持倉中',
                 '進場價': entry_price,
                 '現價/出場': curr_price,
-                '報酬率%': real_pnl_percent, # 顯示槓桿後報酬
+                '報酬率%': real_pnl_percent,
                 '損益(USD)': float_pnl_usd,
                 '結算餘額': realized_balance + floating_pnl_total
             })
@@ -128,12 +124,11 @@ def generate_report():
     # --- 輸出報表 ---
     report_df = pd.DataFrame(report_data)
     
-    print("\n" + "="*120) # 加長分隔線以容納新欄位
+    print("\n" + "="*120)
     print(f"💰 資產績效報表 (本金: ${INITIAL_CAPITAL:,.0f})")
     print("="*120)
     
     if not report_df.empty:
-        # ✅ 這裡定義你想看到的欄位順序
         display_cols = ['時間', '幣種', '方向', '策略', '槓桿', '狀態', '進場價', '現價/出場', '報酬率%', '損益(USD)', '結算餘額']
         print(report_df[display_cols].to_string(index=False))
     else:
@@ -141,13 +136,66 @@ def generate_report():
 
     print("-" * 120)
     
+    # =========================================================
+    # ✅ [新增] 勝率與交易統計計算
+    # =========================================================
+    total_closed = len(closed_df)
+    winning_trades = len(closed_df[closed_df['PnL_Percent'] > 0])
+    losing_trades = len(closed_df[closed_df['PnL_Percent'] <= 0])
+    
+    # 防止除以零錯誤
+    win_rate = (winning_trades / total_closed * 100) if total_closed > 0 else 0.0
+    
     total_return_pct = ((final_equity - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
     
+    # 顯示統計資訊
+    print(f"[SUMMARY] 交易筆數 (Trades) : {total_closed} (Win: {winning_trades} / Loss: {losing_trades})")
+    print(f"[SUMMARY] 勝率 (Win Rate)   : {win_rate:.2f}%")  # ✅ 顯示勝率
     print(f"[SUMMARY] 現金餘額 (Balance): ${realized_balance:,.2f}")
     print(f"[SUMMARY] 浮動損益 (Floating): ${floating_pnl_total:,.2f}")
     print(f"[SUMMARY] 帳戶淨值 (Equity) : ${final_equity:,.2f}")
     print(f"[SUMMARY] 總報酬率 (ROI)    : {total_return_pct:.2f}%")
     print("=" * 120)
+
+    # --- 繪圖 ---
+    try:
+        # 繪圖邏輯不變
+        balance = INITIAL_CAPITAL
+        equity_curve = [INITIAL_CAPITAL]
+        dates = [closed_df['Exit_Time'].min() - pd.Timedelta(hours=4)] if not closed_df.empty else [datetime.now()]
+        
+        # 重算一次只為了畫圖 (使用 closed_df)
+        temp_bal = INITIAL_CAPITAL
+        for index, row in closed_df.iterrows():
+            bet_size = temp_bal * POSITION_SIZE_RATIO
+            leverage = float(row.get('Leverage', 1))
+            pnl = row['PnL_Percent'] * leverage
+            temp_bal += bet_size * (pnl / 100)
+            dates.append(row['Exit_Time'])
+            equity_curve.append(temp_bal)
+            
+        # 加入浮動損益點
+        dates.append(datetime.now())
+        equity_curve.append(final_equity)
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(dates[:-1], equity_curve[:-1], marker='o', linestyle='-', color='#1f77b4', label='Realized Balance')
+        plt.plot(dates[-2:], equity_curve[-2:], marker='d', linestyle='--', color='orange', label='Floating Equity')
+        plt.axhline(y=INITIAL_CAPITAL, color='gray', linestyle='--', alpha=0.5, label='Initial Capital')
+        
+        plt.title(f"Portfolio Performance (Win Rate: {win_rate:.1f}% | ROI: {total_return_pct:.2f}%)", fontsize=14)
+        plt.xlabel("Date")
+        plt.ylabel("Value (USD)")
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend()
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+        plt.gcf().autofmt_xdate()
+
+        output_img = 'data/performance_chart.png'
+        plt.savefig(output_img)
+        print(f"[SUCCESS] 損益圖表已儲存為: {output_img}")
+    except Exception as e:
+        print(f"[ERROR] 繪圖失敗: {e}")
 
 if __name__ == "__main__":
     generate_report()

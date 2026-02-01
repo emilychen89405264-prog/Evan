@@ -1,5 +1,6 @@
 import ccxt
 import pandas as pd
+import pandas_ta as ta
 import numpy as np
 import os
 import joblib
@@ -15,21 +16,38 @@ from paper_trader import execute_trade, monitor_positions, get_open_positions
 
 # --- 設定 ---
 TIMEFRAME = '4h'
-TARGET_ACTIVE_COINS = 10   # 目標：每一輪都要確保有 10 個有效幣種被分析
-SCAN_POOL_SIZE = 50        # 候選池：一次抓 50 個，預防有幣被打槍，才有足夠的候補補上
-CONFIDENCE_THRESHOLD = 40.0
+TARGET_ACTIVE_COINS = 10   # 目標：一定要湊滿 10 個「下單訊號」
+SCAN_POOL_SIZE = 100       # 擴大搜尋範圍，確保有足夠的幣可以掃
+CONFIDENCE_THRESHOLD = 50.0 
 MODELS_DIR = 'models/'
 DATA_DIR = 'data/'
 
 # 排除清單
 EXCLUDE_SYMBOLS = ['USDT/USDT', 'USDC/USDT', 'FDUSD/USDT', 'TUSD/USDT', 'DAI/USDT', 'WBTC/USDT']
 
-def get_market_candidates(limit=50):
+def get_btc_trend():
     """
-    從 Binance 抓取大量候選名單 (例如前 50 名)
-    這樣就算中間有幣被過濾掉，後面還有候補可以補上
+    判斷比特幣大盤趨勢
     """
-    print(f"[SCANNER] 正在掃描市場前 {limit} 大熱門幣種...")
+    try:
+        exchange = ccxt.binance()
+        ohlcv = exchange.fetch_ohlcv('BTC/USDT', '4h', limit=210)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['EMA_200'] = df.ta.ema(length=200)
+        
+        current_price = df['close'].iloc[-1]
+        ema_200 = df['EMA_200'].iloc[-1]
+        
+        if pd.isna(ema_200): return "NEUTRAL"
+
+        if current_price > ema_200: return "BULL"
+        else: return "BEAR"
+    except Exception as e:
+        print(f"[警告] 無法獲取 BTC 趨勢: {e}")
+        return "NEUTRAL"
+
+def get_market_candidates(limit=100):
+    print(f"[掃描] 正在掃描市場前 {limit} 大熱門幣種...")
     try:
         exchange = ccxt.binance()
         tickers = exchange.fetch_tickers()
@@ -41,17 +59,13 @@ def get_market_candidates(limit=50):
                     'volume': ticker['quoteVolume']
                 })
         df = pd.DataFrame(data)
-        # 排序並取前 N 名
         df = df.sort_values(by='volume', ascending=False).head(limit)
         return df['symbol'].tolist()
     except Exception as e:
-        print(f"[ERROR] 掃描失敗: {e}")
+        print(f"[錯誤] 掃描失敗: {e}")
         return []
 
 def analyze_potential(symbol):
-    """
-    篩選 1: 波動率檢查
-    """
     try:
         exchange = ccxt.binance()
         ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=50)
@@ -60,37 +74,33 @@ def analyze_potential(symbol):
         avg_volatility = df['volatility'].mean() * 100
         
         if avg_volatility < 0.5:
-            print(f"[FILTER] {symbol} 波動率過低 ({avg_volatility:.2f}%)，跳過 (尋找下一個)。")
+            # 波動太低，不算有效候選人
+            print(f"[過濾] {symbol} 波動率過低 ({avg_volatility:.2f}%)，跳過。")
             return False
         return True
     except:
         return False
 
 def ensure_model_exists(symbol):
-    """
-    篩選 2: 數據長度與模型訓練檢查
-    如果訓練失敗 (例如數據太短)，回傳 False，讓主迴圈去找下一個幣
-    """
     clean_symbol = symbol.replace('/', '')
     model_path = os.path.join(MODELS_DIR, f"{clean_symbol}_model.keras")
     scaler_path = os.path.join(MODELS_DIR, f"{clean_symbol}_scaler.pkl")
     
     if not os.path.exists(model_path) or not os.path.exists(scaler_path):
-        print(f"[MANAGER] 尚未擁有 {symbol} 的模型，啟動自動訓練流程...")
+        print(f"[經理人] 尚未擁有 {symbol} 的模型，啟動自動訓練流程...")
         success = run_pipeline_for_coin(symbol)
-        
         if success:
-            print(f"[SUCCESS] {symbol} 模型訓練完成。")
+            print(f"[成功] {symbol} 模型訓練完成。")
             return True
         else:
-            # 這裡就是關鍵：如果訓練失敗 (例如 FOGOUSDT 資料太少)，回傳 False
-            print(f"[SKIP] {symbol} 訓練失敗或數據不足，跳過 (尋找下一個)。")
+            print(f"[跳過] {symbol} 訓練失敗或數據不足。")
             return False
     return True
 
-def analyze_market(symbol):
+def analyze_market(symbol, btc_trend):
     """
-    執行預測與下單 (包含策略與槓桿資訊)
+    執行預測與下單
+    回傳: True (有下單), False (沒下單/觀望/被過濾)
     """
     clean_symbol = symbol.replace('/', '')
     model_path = os.path.join(MODELS_DIR, f"{clean_symbol}_model.keras")
@@ -101,9 +111,8 @@ def analyze_market(symbol):
         model = load_model(model_path)
         
         df = get_latest_data(symbol, TIMEFRAME)
-        if df.empty: return
+        if df.empty: return False
         
-        # 取得預測資料與策略資訊
         X_input, market_info = process_data(df, scaler)
         
         prediction = model.predict(X_input, verbose=0)
@@ -111,100 +120,122 @@ def analyze_market(symbol):
         prob_sell = prediction[0][2] * 100
         action = np.argmax(prediction)
         
-        # ✅ 從 market_info 讀取策略參數
-        strat_type = market_info['type']     # "LONG_TERM" or "SHORT_TERM"
-        leverage = market_info['leverage']   # e.g., 5
+        # 讀取資訊
+        strat_type = market_info['type']
+        leverage = market_info['leverage']
         tp_mult = market_info['tp_mult']
         sl_mult = market_info['sl_mult']
         current_price = market_info['close']
         atr = market_info['ATR']
         
-        print(f"\n[ANALYSIS] 標的: {symbol}")
-        print(f"   現價: {current_price:.4f} | ATR: {atr:.4f} | ADX: {market_info['adx']:.1f}")
-        print(f"   策略: {strat_type} | 建議槓桿: {leverage}x")
+        print(f"\n[分析] 標的: {symbol}")
+        print(f"   現價: {current_price:.4f} | ATR: {atr:.4f} | 策略: {strat_type} ({leverage}x)")
         print(f"   信心: Buy({prob_buy:.1f}%) | Sell({prob_sell:.1f}%)")
         
+        decision_msg = ""
         trade_action = None
         
-        # 根據策略計算 TP/SL
-        if action == 1 and prob_buy > CONFIDENCE_THRESHOLD:
-            trade_action = "BUY"
-            tp = current_price + (atr * tp_mult)
-            sl = current_price - (atr * sl_mult)
-            
-        elif action == 2 and prob_sell > CONFIDENCE_THRESHOLD:
-            trade_action = "SELL"
-            tp = current_price - (atr * tp_mult)
-            sl = current_price + (atr * sl_mult)
-            
+        # --- 訊號判斷 ---
+        if action == 1: # AI 建議: BUY
+            if prob_buy > CONFIDENCE_THRESHOLD:
+                if btc_trend == "BEAR":
+                    decision_msg = f"[過濾] 訊號 Buy 但 BTC 處於熊市 (EMA200之下)，取消"
+                else:
+                    trade_action = "BUY"
+                    tp = current_price + (atr * tp_mult)
+                    sl = current_price - (atr * sl_mult)
+            else:
+                decision_msg = f"[觀望] 買入訊號信心不足 ({prob_buy:.1f}% < {CONFIDENCE_THRESHOLD}%)"
+
+        elif action == 2: # AI 建議: SELL
+            if prob_sell > CONFIDENCE_THRESHOLD:
+                if btc_trend == "BULL":
+                    decision_msg = f"[過濾] 訊號 Sell 但 BTC 處於牛市 (EMA200之上)，取消"
+                else:
+                    trade_action = "SELL"
+                    tp = current_price - (atr * tp_mult)
+                    sl = current_price + (atr * sl_mult)
+            else:
+                decision_msg = f"[觀望] 賣出訊號信心不足 ({prob_sell:.1f}% < {CONFIDENCE_THRESHOLD}%)"
+                
+        else: # AI 建議: HOLD
+            decision_msg = f"[觀望] AI 判斷目前應持倉觀望 (Hold)"
+
+        # --- 執行或顯示結果 ---
         if trade_action:
-            print(f"   [SIGNAL] ★ 發現 {trade_action} 機會！準備下單...")
-            
-            # ✅ [關鍵修改] 呼叫下單函式，傳入策略與槓桿
-            execute_trade(
+            print(f"   [訊號] 發現 {trade_action} 機會！正在執行下單...")
+            success = execute_trade(
                 symbol=symbol, 
                 action=trade_action, 
                 price=current_price, 
                 tp=tp, 
                 sl=sl, 
-                strategy=strat_type, # 傳入策略類型
-                leverage=leverage    # 傳入槓桿倍數
+                strategy=strat_type, 
+                leverage=leverage
             )
+            # 只有當 execute_trade 真正成功(寫入CSV)才算 True
+            return success
         else:
-            print(f"   [DECISION] 觀望 (信心不足)")
+            print(f"   [決策] {decision_msg}")
+            return False
 
     except Exception as e:
-        print(f"[ERROR] 分析 {symbol} 時發生錯誤: {e}")
+        print(f"[錯誤] 分析 {symbol} 時發生錯誤: {e}")
+        return False
 
 def fund_manager_cycle():
-    print(f"\n[SYSTEM] {datetime.now()} - 開始新一輪資產配置...")
+    print(f"\n[系統] {datetime.now()} - 開始新一輪資產配置...")
     
-    # 1. 監控現有持倉 (平倉獲利)
     monitor_positions()
     
-    # 2. 獲取大量候選名單 (一次抓 50 個，確保夠用)
-    candidates = get_market_candidates(limit=SCAN_POOL_SIZE)
+    btc_trend = get_btc_trend()
+    print(f"[市場] BTC 大盤趨勢: {btc_trend} (作為多空濾網)")
     
-    # 3. 取得目前手上的持倉 (為了避免重複下單)
+    # 擴大候選池到 100，避免因為過濾太嚴格而找不到 10 個
+    candidates = get_market_candidates(limit=SCAN_POOL_SIZE)
     open_positions = get_open_positions()
     
-    print(f"[SYSTEM] 準備挑選 {TARGET_ACTIVE_COINS} 個有效標的進行分析...")
+    print(f"[系統] 正在搜尋 {TARGET_ACTIVE_COINS} 個可執行的交易訊號...")
     
-    # 計數器：紀錄我們已經成功分析了幾個幣
-    processed_count = 0
+    signals_found = 0 # 計數器：只計算「成功下單」的次數
     
     for symbol in candidates:
-        # 如果已經達成目標數量 (例如 10 個)，就提早下班
-        if processed_count >= TARGET_ACTIVE_COINS:
-            print(f"[SYSTEM] 已完成 {TARGET_ACTIVE_COINS} 個標的的分析，結束本輪掃描。")
+        # 1. 如果已經找到 10 個下單機會，就收工
+        if signals_found >= TARGET_ACTIVE_COINS:
+            print(f"[系統] 目標達成。已找到 {signals_found} 個交易訊號。")
             break
             
-        # --- 檢查 1: 是否已持倉 ---
+        # 2. 檢查持倉：已持有的跳過 (不佔名額，繼續找下一個)
         if symbol in open_positions:
-            print(f"[SKIP] 已持有 {symbol} 部位，跳過開單分析 (佔用 1 個名額)。")
-            # 雖然跳過分析，但也算是一個「被管理的標的」，所以計數器 +1
-            processed_count += 1 
-            continue
+            print(f"[跳過] {symbol} 已在持倉中，搜尋下一個...")
+            continue 
             
         print("-" * 50)
-        print(f"[CHECK] 候選人 {processed_count + 1}/{TARGET_ACTIVE_COINS}: {symbol}")
+        print(f"[檢查] 候選人: {symbol}")
         
-        # --- 檢查 2: 波動率 (太低就找下一個) ---
+        # 3. 檢查波動率：太低跳過 (不佔名額)
         if not analyze_potential(symbol):
-            continue # 不加 processed_count，直接進下一迴圈找替補
+            continue 
             
-        # --- 檢查 3: 模型與數據長度 (訓練失敗就找下一個) ---
+        # 4. 檢查模型：訓練失敗跳過 (不佔名額)
         if not ensure_model_exists(symbol):
-            continue # 不加 processed_count，直接進下一迴圈找替補
+            continue 
             
-        # --- 通過所有考驗，進行分析 ---
-        analyze_market(symbol)
+        # 5. 進行分析並嘗試下單
+        is_traded = analyze_market(symbol, btc_trend)
         
-        # 成功分析完一個，計數器 +1
-        processed_count += 1
+        if is_traded:
+            signals_found += 1
+            print(f"[進度] 已發現訊號: {signals_found}/{TARGET_ACTIVE_COINS}")
+        else:
+            # 雖然分析了，但沒下單，所以不計入 signals_found，繼續找下一個
+            pass
+
+    if signals_found < TARGET_ACTIVE_COINS:
+        print(f"[警告] 候選池已耗盡。在 {SCAN_POOL_SIZE} 個幣種中僅找到 {signals_found} 個訊號。")
 
     print("-" * 50)
-    print(f"[SYSTEM] 本輪結束 (共處理 {processed_count} 個有效標的)，等待下一次喚醒。")
+    print(f"[系統] 本輪結束，等待下一次喚醒。")
 
 if __name__ == "__main__":
     os.makedirs(MODELS_DIR, exist_ok=True)

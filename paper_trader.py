@@ -8,10 +8,10 @@ import time
 PORTFOLIO_FILE = 'data/paper_portfolio.csv'
 
 def init_portfolio():
-    """初始化帳本 CSV (新增 Strategy 與 Leverage 欄位)"""
+    """初始化帳本 CSV (包含 Strategy 與 Leverage)"""
     if not os.path.exists(PORTFOLIO_FILE):
         df = pd.DataFrame(columns=[
-            'Symbol', 'Action', 'Strategy', 'Leverage',  # ✅ 新增欄位
+            'Symbol', 'Action', 'Strategy', 'Leverage', 
             'Entry_Time', 'Entry_Price', 
             'TP', 'SL', 'Status', 'Exit_Time', 'Exit_Price', 'PnL_Percent'
         ])
@@ -19,7 +19,6 @@ def init_portfolio():
         print(f"[SYSTEM] 建立新帳本: {PORTFOLIO_FILE}")
 
 def get_open_positions():
-    """回傳目前持有中的幣種清單"""
     init_portfolio()
     try:
         df = pd.read_csv(PORTFOLIO_FILE)
@@ -44,8 +43,8 @@ def execute_trade(symbol, action, price, tp, sl, strategy, leverage):
         new_trade = {
             'Symbol': symbol,
             'Action': action,
-            'Strategy': strategy,   # ✅ 寫入策略
-            'Leverage': leverage,   # ✅ 寫入槓桿
+            'Strategy': strategy,
+            'Leverage': leverage,
             'Entry_Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'Entry_Price': price,
             'TP': tp,
@@ -73,7 +72,6 @@ def monitor_positions():
         df = pd.read_csv(PORTFOLIO_FILE)
         if df.empty: return
 
-        # 強制轉型避免 Pandas 報錯
         df['Exit_Time'] = df['Exit_Time'].astype('object')
         df['Status'] = df['Status'].astype('object')
 
@@ -97,16 +95,13 @@ def monitor_positions():
                 current_price = ticker['last']
                 exit_reason = None
                 
-                # 計算原始漲跌幅 (不含槓桿)
                 if action == 'BUY':
                     raw_pnl = (current_price - entry_price) / entry_price
                 else:
                     raw_pnl = (entry_price - current_price) / entry_price
                 
-                # 這裡我們只記錄原始漲幅，顯示時再乘槓桿，保持數據純淨
                 pnl_percent = raw_pnl * 100 
 
-                # 檢查出場條件
                 if action == 'BUY':
                     if current_price >= tp: exit_reason = 'WIN'
                     elif current_price <= sl: exit_reason = 'LOSS'
