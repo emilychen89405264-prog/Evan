@@ -12,12 +12,13 @@ from tensorflow.keras.models import load_model
 # 匯入工具與交易模組
 from trainer_interface import run_pipeline_for_coin
 from predict_optimized import get_latest_data, process_data
-from paper_trader import execute_trade, monitor_positions, get_open_positions
+from paper_trader import execute_trade as paper_execute, monitor_positions, get_open_positions
+from bybit_executor import execute_real_trade, get_account_balance, get_ticker_price
 
 # --- 設定 ---
 TIMEFRAME = '4h'
-TARGET_ACTIVE_COINS = 10   # 目標：一定要湊滿 10 個「下單訊號」
-SCAN_POOL_SIZE = 100       # 擴大搜尋範圍，確保有足夠的幣可以掃
+TARGET_ACTIVE_COINS = 10  
+SCAN_POOL_SIZE = 100      
 CONFIDENCE_THRESHOLD = 50.0 
 MODELS_DIR = 'models/'
 DATA_DIR = 'data/'
@@ -47,18 +48,24 @@ def get_btc_trend():
         return "NEUTRAL"
 
 def get_market_candidates(limit=100):
-    print(f"[掃描] 正在掃描市場前 {limit} 大熱門幣種...")
+    print(f"[掃描] 正在掃描 Bybit 市場前 {limit} 大熱門幣種...")
     try:
-        exchange = ccxt.binance()
+        exchange = ccxt.bybit({'options': {'defaultType': 'linear'}})
         tickers = exchange.fetch_tickers()
         data = []
+        
         for symbol, ticker in tickers.items():
+            # Bybit 的合約符號通常是 BTC/USDT:USDT，我們過濾 USDT 結尾的
             if '/USDT' in symbol and symbol not in EXCLUDE_SYMBOLS:
+                # 確保有交易量資訊
+                quote_vol = ticker.get('quoteVolume') or 0
                 data.append({
                     'symbol': symbol,
-                    'volume': ticker['quoteVolume']
+                    'volume': quote_vol
                 })
+        
         df = pd.DataFrame(data)
+        # 按成交量排序
         df = df.sort_values(by='volume', ascending=False).head(limit)
         return df['symbol'].tolist()
     except Exception as e:
@@ -67,14 +74,15 @@ def get_market_candidates(limit=100):
 
 def analyze_potential(symbol):
     try:
-        exchange = ccxt.binance()
+        # ✅ 改用 Bybit 抓 K 線
+        exchange = ccxt.bybit({'options': {'defaultType': 'linear'}})
         ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=50)
+        
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['volatility'] = (df['high'] - df['low']) / df['close']
         avg_volatility = df['volatility'].mean() * 100
         
         if avg_volatility < 0.5:
-            # 波動太低，不算有效候選人
             print(f"[過濾] {symbol} 波動率過低 ({avg_volatility:.2f}%)，跳過。")
             return False
         return True
@@ -82,7 +90,7 @@ def analyze_potential(symbol):
         return False
 
 def ensure_model_exists(symbol):
-    clean_symbol = symbol.replace('/', '')
+    clean_symbol = symbol.split(':')[0].replace('/', '')
     model_path = os.path.join(MODELS_DIR, f"{clean_symbol}_model.keras")
     scaler_path = os.path.join(MODELS_DIR, f"{clean_symbol}_scaler.pkl")
     
@@ -99,10 +107,10 @@ def ensure_model_exists(symbol):
 
 def analyze_market(symbol, btc_trend):
     """
-    執行預測與下單
-    回傳: True (有下單), False (沒下單/觀望/被過濾)
+    執行預測與下單 (含即時價格校正)
     """
-    clean_symbol = symbol.replace('/', '')
+    clean_symbol = symbol.split(':')[0].replace('/', '')
+    
     model_path = os.path.join(MODELS_DIR, f"{clean_symbol}_model.keras")
     scaler_path = os.path.join(MODELS_DIR, f"{clean_symbol}_scaler.pkl")
     
@@ -125,7 +133,7 @@ def analyze_market(symbol, btc_trend):
         leverage = market_info['leverage']
         tp_mult = market_info['tp_mult']
         sl_mult = market_info['sl_mult']
-        current_price = market_info['close']
+        current_price = market_info['close'] # 這是 CSV 裡的價格 (可能是舊的)
         atr = market_info['ATR']
         
         print(f"\n[分析] 標的: {symbol}")
@@ -135,6 +143,10 @@ def analyze_market(symbol, btc_trend):
         decision_msg = ""
         trade_action = None
         
+        # 預設的 TP/SL (基於 CSV 價格，僅供參考或模擬用)
+        tp = 0
+        sl = 0
+
         # --- 訊號判斷 ---
         if action == 1: # AI 建議: BUY
             if prob_buy > CONFIDENCE_THRESHOLD:
@@ -163,18 +175,69 @@ def analyze_market(symbol, btc_trend):
 
         # --- 執行或顯示結果 ---
         if trade_action:
-            print(f"   [訊號] 發現 {trade_action} 機會！正在執行下單...")
-            success = execute_trade(
+            print(f"   [訊號] 發現 {trade_action} 機會！正在執行程序...")
+            
+            real_time_price = get_ticker_price(symbol)
+            final_tp = tp
+            final_sl = sl
+            record_price = current_price # 預設紀錄價格
+            
+            if real_time_price:
+                print(f"   [校正] CSV價格: {current_price:.4f} -> Bybit即時價: {real_time_price:.4f}")
+                record_price = real_time_price # 更新紀錄價格為真實價格
+                
+                # 重新計算止盈止損
+                if trade_action == "BUY":
+                    final_tp = real_time_price + (atr * tp_mult)
+                    final_sl = real_time_price - (atr * sl_mult)
+                elif trade_action == "SELL":
+                    final_tp = real_time_price - (atr * tp_mult)
+                    final_sl = real_time_price + (atr * sl_mult)
+            else:
+                print(f"   [警告] 無法獲取即時價格，將沿用 CSV 價格嘗試下單...")
+            # ==========================================
+
+            # 1. 計算資金
+            current_balance = get_account_balance()
+            if current_balance <= 0: current_balance = 1000 
+            
+            position_size_usdt = current_balance * 0.1 
+            real_order_success = False
+
+            if position_size_usdt < 10: 
+                print(f"[警告] 資金不足 (${position_size_usdt:.2f})，僅執行模擬交易。")
+            else:
+                # 2. 嘗試發送真實訂單 (使用校正後的 final_tp/final_sl)
+                real_order_success = execute_real_trade(
+                    symbol=symbol,
+                    action=trade_action,
+                    quantity_usdt=position_size_usdt,
+                    leverage=leverage,
+                    tp_price=final_tp, 
+                    sl_price=final_sl  
+                )
+
+            # 3. 邏輯分支處理
+            if real_order_success:
+                print(f"   [成功] 實盤下單成功！同步記錄至 CSV。")
+            else:
+                print(f"   [降級] 實盤下單失敗/跳過 (可能流動性不足)，轉為純模擬交易 (Paper Trade)。")
+
+            # 4. 記錄交易 (Paper Execute)
+            # 不管實盤有沒有成功，都記錄下來
+            paper_execute(
                 symbol=symbol, 
                 action=trade_action, 
-                price=current_price, 
-                tp=tp, 
-                sl=sl, 
+                price=record_price, 
+                tp=final_tp, 
+                sl=final_sl, 
                 strategy=strat_type, 
                 leverage=leverage
             )
-            # 只有當 execute_trade 真正成功(寫入CSV)才算 True
-            return success
+            
+            # 5. 回傳 True (計數器 +1)
+            return True
+
         else:
             print(f"   [決策] {decision_msg}")
             return False
@@ -200,27 +263,31 @@ def fund_manager_cycle():
     signals_found = 0 # 計數器：只計算「成功下單」的次數
     
     for symbol in candidates:
-        # 1. 如果已經找到 10 個下單機會，就收工
-        if signals_found >= TARGET_ACTIVE_COINS:
-            print(f"[系統] 目標達成。已找到 {signals_found} 個交易訊號。")
-            break
-            
-        # 2. 檢查持倉：已持有的跳過 (不佔名額，繼續找下一個)
-        if symbol in open_positions:
-            print(f"[跳過] {symbol} 已在持倉中，搜尋下一個...")
+        # 1. 符號清洗 (Bybit 格式 vs 乾淨格式)
+        clean_symbol = symbol.split(':')[0]
+        
+        # 2. 取得目前持倉清單 (從 paper_trader 或交易所取得)
+        # 注意：這裡要確保 get_open_positions 回傳的是乾淨的符號清單
+        current_positions = [p['symbol'].split(':')[0] for p in get_open_positions()]
+        
+        # 🔥 修正 1: 防止重複下單 (最重要的修正)
+        if clean_symbol in current_positions:
+            # 這裡可以選擇不印出來，或是用 debug level，避免洗版
+            # print(f"[跳過] {clean_symbol} 已在持倉中，避免重複下單。")
             continue 
             
-        print("-" * 50)
-        print(f"[檢查] 候選人: {symbol}")
-        
-        # 3. 檢查波動率：太低跳過 (不佔名額)
+        # 3. 檢查波動率... (原本的代碼)
         if not analyze_potential(symbol):
             continue 
             
-        # 4. 檢查模型：訓練失敗跳過 (不佔名額)
-        if not ensure_model_exists(symbol):
-            continue 
-            
+        # ... (中間省略) ...
+
+        # 4. 在下單前檢查「最大持倉數量」
+        # 假設我們最多只能持倉 10 檔，避免資金爆掉
+        if len(current_positions) >= 10:
+             print(f"[警告] 倉位已滿 (10/10)，停止開新倉。")
+             break # 直接跳出迴圈，不再找新幣
+
         # 5. 進行分析並嘗試下單
         is_traded = analyze_market(symbol, btc_trend)
         

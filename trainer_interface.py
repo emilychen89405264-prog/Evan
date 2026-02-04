@@ -31,9 +31,8 @@ def run_pipeline_for_coin(symbol, timeframe='4h'):
     """
     一鍵完成：抓資料 -> 算指標 -> 標註 -> 訓練 -> 存檔
     """
-    clean_symbol = symbol.replace('/', '')
+    clean_symbol = symbol.split(':')[0].replace('/', '')
     
-    # ✅ 設定該幣種的專屬資料目錄: data/ETHUSDT/
     coin_data_dir = os.path.join(DATA_DIR, clean_symbol)
     os.makedirs(coin_data_dir, exist_ok=True) # 確保目錄存在
 

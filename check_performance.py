@@ -1,201 +1,188 @@
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import ccxt
+import time
 import os
-from datetime import datetime
 
-# --- 設定 ---
-PORTFOLIO_FILE = 'data/paper_portfolio.csv'
-INITIAL_CAPITAL = 50000.0   
-POSITION_SIZE_RATIO = 0.1   
+# ==========================================
+# 🛠️ 設定區
+# ==========================================
+CSV_FILE = 'data/paper_portfolio.csv'
+INITIAL_BALANCE = 50000
+POSITION_SIZE_RATIO = 0.1
 
-# ✅ 設定 Pandas 顯示格式
-pd.set_option('display.unicode.east_asian_width', True)
+# ✅ 設定 Pandas 顯示參數
+pd.set_option('display.unicode.east_asian_width', True)  # 支援中文寬度
 pd.set_option('display.max_columns', None)
-pd.set_option('display.width', 1000)
-pd.set_option('display.float_format', '{:,.2f}'.format)
+pd.set_option('display.width', 2000)                     # 設定總寬度大一點
 
-def get_current_prices(symbols):
-    prices = {}
-    if not symbols: return prices
-    print(f"[NET] 查詢 {len(symbols)} 個持倉現價...")
+# 初始化查價引擎
+bybit = ccxt.bybit({'options': {'defaultType': 'linear'}})
+binance = ccxt.binance()
+
+def get_price_with_fallback(symbol):
+    """ 雙重查價機制 """
     try:
-        exchange = ccxt.binance()
-        tickers = exchange.fetch_tickers(symbols)
-        for symbol, ticker in tickers.items():
-            prices[symbol] = ticker['last']
+        ticker = bybit.fetch_ticker(symbol)
+        return float(ticker['last']), "Bybit"
+    except:
+        pass
+    try:
+        clean_symbol = symbol.split(':')[0].replace('/', '')
+        binance_symbol = symbol.split(':')[0]
+        ticker = binance.fetch_ticker(binance_symbol)
+        return float(ticker['last']), "Binance"
+    except:
+        pass
+    return None, "Fail"
+
+def check_performance():
+    if not os.path.exists(CSV_FILE):
+        print(f"[錯誤] 找不到交易紀錄檔: {CSV_FILE}")
+        return
+
+    print(">>> 正在讀取並計算最新損益 (請稍候)...")
+    
+    try:
+        df = pd.read_csv(CSV_FILE)
+        df.columns = df.columns.str.strip() # 去除欄位空白
     except Exception as e:
-        print(f"[ERROR] 價格查詢失敗: {e}")
-    return prices
-
-def generate_report():
-    if not os.path.exists(PORTFOLIO_FILE):
-        print("[ERROR] 找不到交易紀錄檔。")
+        print(f"[錯誤] 讀取 CSV 失敗: {e}")
         return
 
-    # 1. 讀取數據
-    df = pd.read_csv(PORTFOLIO_FILE)
-    if df.empty:
-        print("[INFO] 尚無交易紀錄。")
-        return
-        
-    # 補上預設值 (防止舊版 CSV 報錯)
-    if 'Strategy' not in df.columns: df['Strategy'] = 'N/A'
-    if 'Leverage' not in df.columns: df['Leverage'] = 1
+    # 準備列表存資料
+    processed_data = []
 
-    closed_df = df[df['Status'] == 'CLOSED'].copy()
-    open_df = df[df['Status'] == 'OPEN'].copy()
-    
-    closed_df['Exit_Time'] = pd.to_datetime(closed_df['Exit_Time'])
-    closed_df = closed_df.sort_values(by='Exit_Time')
+    # 1. 第一輪迴圈：計算所有單子的損益
+    for index, row in df.iterrows():
+        try:
+            symbol = row.get('Symbol') or row.get('symbol')
+            action = row.get('Action') or row.get('action')
+            status = row.get('Status') or row.get('status')
+            entry_price = float(row.get('Entry_Price') or row.get('entry_price') or 0)
+            
+            entry_time_str = row.get('Entry_Time') or row.get('timestamp')
+            entry_time_dt = pd.to_datetime(entry_time_str)
+            time_display = str(entry_time_dt)[5:16]
 
-    # --- 計算已實現損益 ---
-    balance = INITIAL_CAPITAL
-    report_data = []
+            # 計算倉位大小 (模擬)
+            position_usdt = INITIAL_BALANCE * POSITION_SIZE_RATIO 
+            size = position_usdt / entry_price if entry_price > 0 else 0
+            
+            pnl_u = 0
+            roi = 0.0
+            current_price = entry_price
+            note = "未知"
+            sort_group = 0 # 0:已平倉, 1:持倉中
 
-    for index, row in closed_df.iterrows():
-        bet_size = balance * POSITION_SIZE_RATIO
-        
-        leverage = float(row.get('Leverage', 1))
-        real_pnl_percent = row['PnL_Percent'] * leverage
-        
-        profit_loss_usd = bet_size * (real_pnl_percent / 100)
-        balance += profit_loss_usd
-        
-        report_data.append({
-            '時間': row['Exit_Time'].strftime('%Y-%m-%d %H:%M'),
-            '幣種': row['Symbol'],
-            '方向': row['Action'],
-            '策略': row['Strategy'],
-            '槓桿': f"{leverage:.0f}x",
-            '狀態': '已平倉',
-            '進場價': row['Entry_Price'],
-            '現價/出場': row['Exit_Price'],
-            '報酬率%': real_pnl_percent,
-            '損益(USD)': profit_loss_usd,
-            '結算餘額': balance
-        })
+            # --- 情況 A: 已平倉 ---
+            if status == 'CLOSED':
+                note = "已平倉"
+                sort_group = 0
+                exit_price = float(row.get('Exit_Price') or row.get('exit_price') or entry_price)
+                current_price = exit_price
+                
+                if 'PnL_Percent' in row and pd.notnull(row['PnL_Percent']):
+                    roi = float(row['PnL_Percent'])
+                    pnl_u = position_usdt * (roi / 100)
+                else:
+                    if action == 'BUY':
+                        pnl_u = (exit_price - entry_price) * size
+                    else:
+                        pnl_u = (entry_price - exit_price) * size
+                    roi = (pnl_u / position_usdt) * 100
 
-    realized_balance = balance 
+            # --- 情況 B: 持倉中 ---
+            elif status == 'OPEN' or status == 'Held':
+                note = "持倉中"
+                sort_group = 1
+                live_price, source = get_price_with_fallback(symbol)
+                
+                if live_price:
+                    current_price = live_price
+                    if action == 'BUY':
+                        raw_pnl = (current_price - entry_price) * size
+                    else: # SELL
+                        raw_pnl = (entry_price - current_price) * size
+                    
+                    pnl_u = raw_pnl
+                    roi = (raw_pnl / position_usdt) * 100
+                else:
+                    note = "查無價"
 
-    # --- 計算持倉浮動損益 ---
-    floating_pnl_total = 0
-    
-    if not open_df.empty:
-        open_symbols = open_df['Symbol'].unique().tolist()
-        current_prices = get_current_prices(open_symbols)
-        
-        for index, row in open_df.iterrows():
-            symbol = row['Symbol']
-            entry_price = row['Entry_Price']
-            action = row['Action']
-            leverage = float(row.get('Leverage', 1))
-            
-            curr_price = current_prices.get(symbol, entry_price)
-            
-            if action == 'BUY':
-                raw_pct = (curr_price - entry_price) / entry_price * 100
-            else:
-                raw_pct = (entry_price - curr_price) / entry_price * 100
-            
-            real_pnl_percent = raw_pct * leverage
-            bet_size = realized_balance * POSITION_SIZE_RATIO
-            float_pnl_usd = bet_size * (real_pnl_percent / 100)
-            
-            floating_pnl_total += float_pnl_usd
-            
-            report_data.append({
-                '時間': '持倉中',
-                '幣種': symbol,
-                '方向': action,
-                '策略': row['Strategy'],
-                '槓桿': f"{leverage:.0f}x",
-                '狀態': '持倉中',
-                '進場價': entry_price,
-                '現價/出場': curr_price,
-                '報酬率%': real_pnl_percent,
-                '損益(USD)': float_pnl_usd,
-                '結算餘額': realized_balance + floating_pnl_total
+            # 存入列表
+            processed_data.append({
+                "raw_time": entry_time_dt,
+                "sort_group": sort_group,
+                "時間": time_display,
+                "幣種": symbol,
+                "方向": action,
+                "狀態": note,
+                "進場價": entry_price,
+                "現價/出場": current_price,
+                "報酬率%": roi,      
+                "損益(U)": pnl_u     
             })
-
-    final_equity = realized_balance + floating_pnl_total
-    
-    # --- 輸出報表 ---
-    report_df = pd.DataFrame(report_data)
-    
-    print("\n" + "="*120)
-    print(f"💰 資產績效報表 (本金: ${INITIAL_CAPITAL:,.0f})")
-    print("="*120)
-    
-    if not report_df.empty:
-        display_cols = ['時間', '幣種', '方向', '策略', '槓桿', '狀態', '進場價', '現價/出場', '報酬率%', '損益(USD)', '結算餘額']
-        print(report_df[display_cols].to_string(index=False))
-    else:
-        print("目前無任何交易紀錄。")
-
-    print("-" * 120)
-    
-    # =========================================================
-    # ✅ [新增] 勝率與交易統計計算
-    # =========================================================
-    total_closed = len(closed_df)
-    winning_trades = len(closed_df[closed_df['PnL_Percent'] > 0])
-    losing_trades = len(closed_df[closed_df['PnL_Percent'] <= 0])
-    
-    # 防止除以零錯誤
-    win_rate = (winning_trades / total_closed * 100) if total_closed > 0 else 0.0
-    
-    total_return_pct = ((final_equity - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
-    
-    # 顯示統計資訊
-    print(f"[SUMMARY] 交易筆數 (Trades) : {total_closed} (Win: {winning_trades} / Loss: {losing_trades})")
-    print(f"[SUMMARY] 勝率 (Win Rate)   : {win_rate:.2f}%")  # ✅ 顯示勝率
-    print(f"[SUMMARY] 現金餘額 (Balance): ${realized_balance:,.2f}")
-    print(f"[SUMMARY] 浮動損益 (Floating): ${floating_pnl_total:,.2f}")
-    print(f"[SUMMARY] 帳戶淨值 (Equity) : ${final_equity:,.2f}")
-    print(f"[SUMMARY] 總報酬率 (ROI)    : {total_return_pct:.2f}%")
-    print("=" * 120)
-
-    # --- 繪圖 ---
-    try:
-        # 繪圖邏輯不變
-        balance = INITIAL_CAPITAL
-        equity_curve = [INITIAL_CAPITAL]
-        dates = [closed_df['Exit_Time'].min() - pd.Timedelta(hours=4)] if not closed_df.empty else [datetime.now()]
-        
-        # 重算一次只為了畫圖 (使用 closed_df)
-        temp_bal = INITIAL_CAPITAL
-        for index, row in closed_df.iterrows():
-            bet_size = temp_bal * POSITION_SIZE_RATIO
-            leverage = float(row.get('Leverage', 1))
-            pnl = row['PnL_Percent'] * leverage
-            temp_bal += bet_size * (pnl / 100)
-            dates.append(row['Exit_Time'])
-            equity_curve.append(temp_bal)
             
-        # 加入浮動損益點
-        dates.append(datetime.now())
-        equity_curve.append(final_equity)
+        except Exception as e:
+            continue
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(dates[:-1], equity_curve[:-1], marker='o', linestyle='-', color='#1f77b4', label='Realized Balance')
-        plt.plot(dates[-2:], equity_curve[-2:], marker='d', linestyle='--', color='orange', label='Floating Equity')
-        plt.axhline(y=INITIAL_CAPITAL, color='gray', linestyle='--', alpha=0.5, label='Initial Capital')
-        
-        plt.title(f"Portfolio Performance (Win Rate: {win_rate:.1f}% | ROI: {total_return_pct:.2f}%)", fontsize=14)
-        plt.xlabel("Date")
-        plt.ylabel("Value (USD)")
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend()
-        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-        plt.gcf().autofmt_xdate()
+    # 2. 轉成 DataFrame 進行排序與計算
+    res_df = pd.DataFrame(processed_data)
+    
+    if res_df.empty:
+        print("尚無有效交易資料")
+        return
 
-        output_img = 'data/performance_chart.png'
-        plt.savefig(output_img)
-        print(f"[SUCCESS] 損益圖表已儲存為: {output_img}")
-    except Exception as e:
-        print(f"[ERROR] 繪圖失敗: {e}")
+    # 排序：先已平倉(0)->持倉中(1)，內部再按時間
+    res_df = res_df.sort_values(by=['sort_group', 'raw_time'])
+
+    # 計算累計餘額
+    res_df['balance_calc'] = INITIAL_BALANCE + res_df['損益(U)'].cumsum()
+
+    # --- 📊 統計數據計算 (新增部分) ---
+    closed_trades = res_df[res_df['sort_group'] == 0]
+    total_closed = len(closed_trades)
+    
+    win_count = len(closed_trades[closed_trades['損益(U)'] > 0])
+    loss_count = len(closed_trades[closed_trades['損益(U)'] <= 0])
+    
+    win_rate = (win_count / total_closed * 100) if total_closed > 0 else 0.0
+
+    total_realized = closed_trades['損益(U)'].sum()
+    total_unrealized = res_df[res_df['sort_group'] == 1]['損益(U)'].sum()
+    final_equity = INITIAL_BALANCE + total_realized + total_unrealized
+    total_roi = ((final_equity - INITIAL_BALANCE) / INITIAL_BALANCE) * 100
+
+    # 3. 格式化輸出
+    final_df = pd.DataFrame()
+    final_df['時間'] = res_df['時間']
+    final_df['幣種'] = res_df['幣種']
+    final_df['方向'] = res_df['方向']
+    final_df['狀態'] = res_df['狀態']
+    final_df['進場價'] = res_df['進場價'].apply(lambda x: f"{x:,.4f}")
+    final_df['現價/出場'] = res_df['現價/出場'].apply(lambda x: f"{x:,.4f}")
+    final_df['報酬率%'] = res_df['報酬率%'].apply(lambda x: f"{x:+.2f}%")
+    final_df['損益(U)'] = res_df['損益(U)'].apply(lambda x: f"{x:+.2f}")
+    final_df['累計餘額'] = res_df['balance_calc'].apply(lambda x: f"{x:,.2f}")
+
+    # 4. 輸出報表
+    print(f"\n{'='*130}")
+    print(f"資產績效報表 (本金: ${INITIAL_BALANCE:,.0f}) - {time.strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*130}")
+    
+    # 寬間距設定
+    print(final_df.to_string(index=False, col_space=14, justify='right'))
+
+    print("-" * 130)
+    # 🔥 顯示統計區塊
+    print(f"交易統計 (Stats)        : 總筆數 {total_closed} (勝 {win_count} / 負 {loss_count})")
+    print(f"勝率 (Win Rate)         : {win_rate:.2f}%")
+    print("-" * 130)
+    print(f"已實現損益 (Realized)   : ${total_realized:,.2f}")
+    print(f"浮動損益 (Floating)     : ${total_unrealized:,.2f}")
+    print(f"當前總淨值 (Total Equity): ${final_equity:,.2f}")
+    print(f"總報酬率 (Total ROI)    : {total_roi:+.2f}%")
+    print(f"{'='*130}\n")
 
 if __name__ == "__main__":
-    generate_report()
+    check_performance()
