@@ -8,7 +8,7 @@ model/
 
 # 忽略交易紀錄與報表圖片 (如果你不希望這些被上傳)
 *.png
-paper_trades.csv
+paper_portfolio.csv
 
 # ==========================
 # 🐍 Python 標準忽略

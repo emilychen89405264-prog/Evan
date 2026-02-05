@@ -5,8 +5,8 @@ import time
 # 🔑 Bybit 設定區
 # 請填入從 https://testnet.bybit.com/user/assets/home/settings/api-management 取得的 Key
 # ==========================================
-API_KEY = ''
-SECRET_KEY = ''
+API_KEY = 'DPc7TM6DAmNFosO0zv'
+SECRET_KEY = 'd4vCiitaFMvHSe1gUlHb6uPv9YpnTTOGvmBX'
 
 def check_account_status():
     print(f"[{time.strftime('%H:%M:%S')}] 正在連線到 Bybit Testnet (合約)...")
